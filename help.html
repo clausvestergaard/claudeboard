@@ -1,0 +1,54 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="UTF-8" />
+    <style>
+      * { box-sizing: border-box; margin: 0; padding: 0; }
+      body {
+        background: #111;
+        color: #bbb;
+        font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", sans-serif;
+        font-size: 12px;
+        line-height: 1.6;
+        padding: 16px 20px;
+        -webkit-font-smoothing: antialiased;
+      }
+      h1 { font-size: 14px; color: #f0f0f0; margin-bottom: 10px; }
+      h2 { font-size: 10px; color: #666; text-transform: uppercase; letter-spacing: 0.5px; margin: 10px 0 4px; }
+      ul { list-style: none; }
+      li { padding: 1px 0; }
+      code { background: #222; padding: 1px 5px; border-radius: 3px; font-size: 11px; }
+      strong { color: #f0f0f0; }
+      .dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; vertical-align: middle; margin-right: 4px; }
+      .g { background: #4ade80; }
+      .r { background: #ef4444; }
+      .d { background: #444; }
+      .note { margin-top: 10px; color: #555; font-size: 11px; }
+    </style>
+  </head>
+  <body>
+    <h1>ClaudeBoard</h1>
+    <p>Monitors Claude Code sessions.</p>
+
+    <h2>Status</h2>
+    <ul>
+      <li><span class="dot g"></span> <strong>idle</strong> — waiting for input</li>
+      <li><span class="dot r"></span> <strong>working</strong> — thinking or running tools</li>
+      <li><span class="dot d"></span> <strong>stopped</strong> — session inactive for 5+ minutes</li>
+    </ul>
+
+    <h2>Controls</h2>
+    <ul>
+      <li><strong>−</strong> — remove project from tracking</li>
+      <li><strong>?</strong> — open this help window</li>
+    </ul>
+
+    <h2>CLI</h2>
+    <ul>
+      <li><code>claudeboard add .</code> — track current directory</li>
+      <li><code>claudeboard add /path</code> — track specific path</li>
+    </ul>
+
+    <p class="note">Only shows explicitly tracked projects. Refreshes on changes.</p>
+  </body>
+</html>

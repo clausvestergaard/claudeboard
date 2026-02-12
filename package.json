@@ -1,0 +1,39 @@
+{
+  "name": "claudeboard",
+  "productName": "ClaudeBoard",
+  "version": "1.0.0",
+  "description": "Floating monitor for Claude Code sessions",
+  "license": "MIT",
+  "main": "main.js",
+  "bin": {
+    "claudeboard": "./cli.js"
+  },
+  "scripts": {
+    "start": "electron .",
+    "package": "electron-builder --mac --config"
+  },
+  "build": {
+    "appId": "com.claus.claudeboard",
+    "productName": "ClaudeBoard",
+    "icon": "build/icon.icns",
+    "mac": {
+      "target": "dir",
+      "icon": "build/icon.icns",
+      "category": "public.app-category.developer-tools"
+    },
+    "files": [
+      "cli.js",
+      "main.js",
+      "preload.js",
+      "renderer.js",
+      "index.html",
+      "styles.css",
+      "help.html",
+      "build/icon.png"
+    ]
+  },
+  "devDependencies": {
+    "electron": "^33.0.0",
+    "electron-builder": "^25.0.0"
+  }
+}
