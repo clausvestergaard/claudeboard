@@ -15,9 +15,14 @@ const DATA_FILE = path.join(
 
 function loadData() {
   try {
-    return JSON.parse(fs.readFileSync(DATA_FILE, "utf-8"));
+    const data = JSON.parse(fs.readFileSync(DATA_FILE, "utf-8"));
+    if (!data.projects) data.projects = [];
+    if (!data.archivedProjects) data.archivedProjects = [];
+    if (!data.archivedSessions) data.archivedSessions = [];
+    if (!data.sessionNames) data.sessionNames = {};
+    return data;
   } catch {
-    return { projects: [] };
+    return { projects: [], archivedProjects: [], archivedSessions: [], sessionNames: {} };
   }
 }
 
@@ -113,10 +118,12 @@ function getSessionStatus(jsonlPath) {
 function scanAll() {
   const data = loadData();
   const sessions = discoverSessions();
-  const sessionNames = data.sessionNames || {};
+  const archivedSessions = new Set(data.archivedSessions);
 
   const results = [];
   for (const session of sessions) {
+    if (archivedSessions.has(session.sessionId)) continue;
+
     const { status, mtime } = getSessionStatus(session.jsonlPath);
     if (mtime === 0) continue;
 
@@ -125,7 +132,7 @@ function scanAll() {
       project: session.projectName,
       projectPath: session.projectPath,
       sessionId: session.sessionId,
-      sessionName: sessionNames[session.sessionId] || null,
+      sessionName: data.sessionNames[session.sessionId] || null,
       status,
       mtime,
     });
@@ -138,6 +145,96 @@ function scanAll() {
   });
 
   return results;
+}
+
+/**
+ * Extract the project path (cwd) from a .jsonl session file.
+ * Reads lines until it finds one with a "cwd" field.
+ */
+function extractCwdFromJsonl(jsonlPath) {
+  let fd;
+  try {
+    fd = fs.openSync(jsonlPath, "r");
+    const buf = Buffer.alloc(4096);
+    const bytesRead = fs.readSync(fd, buf, 0, 4096, 0);
+    fs.closeSync(fd);
+
+    const chunk = buf.toString("utf-8", 0, bytesRead);
+    const lines = chunk.split("\n");
+    for (const line of lines) {
+      if (!line.trim()) continue;
+      try {
+        const entry = JSON.parse(line);
+        if (entry.cwd) return entry.cwd;
+      } catch {
+        continue;
+      }
+    }
+  } catch {
+    if (fd !== undefined) try { fs.closeSync(fd); } catch {}
+  }
+  return null;
+}
+
+function discoverUntracked() {
+  const data = loadData();
+  const tracked = new Set(data.projects);
+  const archived = new Set(data.archivedProjects);
+  const seen = new Set();
+  const suggestions = [];
+
+  let dirs;
+  try {
+    dirs = fs.readdirSync(PROJECTS_DIR);
+  } catch {
+    return [];
+  }
+
+  for (const dirName of dirs) {
+    const projDir = path.join(PROJECTS_DIR, dirName);
+
+    let stat;
+    try {
+      stat = fs.statSync(projDir);
+    } catch {
+      continue;
+    }
+    if (!stat.isDirectory()) continue;
+
+    // Find a .jsonl file to extract the real cwd
+    let files;
+    try {
+      files = fs.readdirSync(projDir);
+    } catch {
+      continue;
+    }
+
+    const jsonlFile = files.find((f) => f.endsWith(".jsonl"));
+    if (!jsonlFile) continue;
+
+    const projectPath = extractCwdFromJsonl(path.join(projDir, jsonlFile));
+    if (!projectPath) continue;
+
+    // Skip duplicates, already tracked, or archived
+    if (seen.has(projectPath)) continue;
+    if (tracked.has(projectPath)) continue;
+    if (archived.has(projectPath)) continue;
+    seen.add(projectPath);
+
+    // Verify path exists on disk
+    try {
+      fs.accessSync(projectPath);
+    } catch {
+      continue;
+    }
+
+    suggestions.push({
+      projectPath,
+      projectName: path.basename(projectPath),
+    });
+  }
+
+  return suggestions;
 }
 
 // --- File watcher with debounce ---
@@ -238,8 +335,100 @@ ipcMain.handle("add-project", async () => {
 
 ipcMain.handle("remove-project", (_event, projectPath) => {
   const data = loadData();
-  data.projects = (data.projects || []).filter(p => p !== projectPath);
+  data.projects = data.projects.filter((p) => p !== projectPath);
   saveData(data);
+});
+
+ipcMain.handle("get-suggestions", () => {
+  return discoverUntracked();
+});
+
+ipcMain.handle("add-project-path", (_event, projectPath) => {
+  const data = loadData();
+  if (!data.projects.includes(projectPath)) {
+    data.projects.push(projectPath);
+    saveData(data);
+  }
+  return projectPath;
+});
+
+ipcMain.handle("archive-project", (_event, projectPath) => {
+  const data = loadData();
+  data.projects = data.projects.filter((p) => p !== projectPath);
+  if (!data.archivedProjects.includes(projectPath)) {
+    data.archivedProjects.push(projectPath);
+  }
+  saveData(data);
+});
+
+ipcMain.handle("unarchive-project", (_event, projectPath) => {
+  const data = loadData();
+  data.archivedProjects = data.archivedProjects.filter((p) => p !== projectPath);
+  if (!data.projects.includes(projectPath)) {
+    data.projects.push(projectPath);
+  }
+  saveData(data);
+});
+
+ipcMain.handle("archive-session", (_event, sessionId) => {
+  const data = loadData();
+  if (!data.archivedSessions.includes(sessionId)) {
+    data.archivedSessions.push(sessionId);
+  }
+  saveData(data);
+});
+
+ipcMain.handle("unarchive-session", (_event, sessionId) => {
+  const data = loadData();
+  data.archivedSessions = data.archivedSessions.filter((id) => id !== sessionId);
+  saveData(data);
+});
+
+ipcMain.handle("get-archived", () => {
+  const data = loadData();
+
+  const archivedProjects = data.archivedProjects.map((projectPath) => ({
+    projectPath,
+    projectName: path.basename(projectPath),
+  }));
+
+  const archivedSessions = [];
+  const archivedSessionIds = new Set(data.archivedSessions);
+
+  // Scan all project dirs to find metadata for archived sessions
+  for (const projectPath of [...data.projects, ...data.archivedProjects]) {
+    const dirName = encodePath(projectPath);
+    const projDir = path.join(PROJECTS_DIR, dirName);
+
+    let files;
+    try {
+      files = fs.readdirSync(projDir);
+    } catch {
+      continue;
+    }
+
+    for (const file of files) {
+      if (!file.endsWith(".jsonl")) continue;
+      const sessionId = file.replace(".jsonl", "");
+      if (!archivedSessionIds.has(sessionId)) continue;
+
+      const jsonlPath = path.join(projDir, file);
+      let mtime = 0;
+      try {
+        mtime = fs.statSync(jsonlPath).mtimeMs;
+      } catch {}
+
+      archivedSessions.push({
+        projectPath,
+        projectName: path.basename(projectPath),
+        sessionId,
+        sessionName: data.sessionNames[sessionId] || null,
+        mtime,
+      });
+    }
+  }
+
+  return { archivedProjects, archivedSessions };
 });
 
 ipcMain.handle("rename-session", (_event, sessionId, name) => {
