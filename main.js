@@ -1,6 +1,7 @@
 const { app, BrowserWindow, ipcMain, dialog } = require("electron");
 const path = require("path");
 const fs = require("fs");
+const { execSync } = require("child_process");
 
 const WIDTH = 440;
 const BASE_HEIGHT = 52; // drag region + footer
@@ -63,6 +64,48 @@ const PROJECTS_DIR = path.join(
 const WORKING_THRESHOLD_MS = 30 * 1000;
 const IDLE_THRESHOLD_MS = 5 * 60 * 1000;
 
+/**
+ * Returns a Set of project paths that have a running `claude` process.
+ * Cached for 5 seconds to avoid shelling out on every session check.
+ */
+let _activeCwdsCache = { ts: 0, cwds: new Set() };
+const ACTIVE_CWDS_TTL_MS = 5_000;
+
+function getActiveProjectPaths() {
+  const now = Date.now();
+  if (now - _activeCwdsCache.ts < ACTIVE_CWDS_TTL_MS) {
+    return _activeCwdsCache.cwds;
+  }
+
+  const cwds = new Set();
+  try {
+    // Get PIDs of processes named 'claude'
+    const pids = execSync("pgrep -x claude", { encoding: "utf-8", timeout: 3000 })
+      .trim()
+      .split("\n")
+      .filter(Boolean);
+
+    for (const pid of pids) {
+      try {
+        const lsofOut = execSync(`lsof -p ${pid} -Fn 2>/dev/null | grep -A1 '^fcwd$' | grep '^n'`, {
+          encoding: "utf-8",
+          timeout: 3000,
+        }).trim();
+        if (lsofOut.startsWith("n")) {
+          cwds.add(lsofOut.slice(1));
+        }
+      } catch {
+        // Process may have exited
+      }
+    }
+  } catch {
+    // No claude processes running
+  }
+
+  _activeCwdsCache = { ts: now, cwds };
+  return cwds;
+}
+
 function encodePath(projectPath) {
   return projectPath.replace(/\//g, "-");
 }
@@ -96,7 +139,7 @@ function discoverSessions() {
   return results;
 }
 
-function getSessionStatus(jsonlPath) {
+function getSessionStatus(jsonlPath, projectPath) {
   let mtime;
   try {
     mtime = fs.statSync(jsonlPath).mtimeMs;
@@ -106,13 +149,21 @@ function getSessionStatus(jsonlPath) {
 
   const age = Date.now() - mtime;
 
+  if (age >= IDLE_THRESHOLD_MS) {
+    return { status: "stopped", mtime };
+  }
+
+  // File was recently modified — verify a claude process is actually running
+  // in this project directory. If not, the session was likely cleared/ended.
+  const activePaths = getActiveProjectPaths();
+  if (!activePaths.has(projectPath)) {
+    return { status: "stopped", mtime };
+  }
+
   if (age < WORKING_THRESHOLD_MS) {
     return { status: "working", mtime };
   }
-  if (age < IDLE_THRESHOLD_MS) {
-    return { status: "idle", mtime };
-  }
-  return { status: "stopped", mtime };
+  return { status: "idle", mtime };
 }
 
 function scanAll() {
@@ -124,7 +175,7 @@ function scanAll() {
   for (const session of sessions) {
     if (archivedSessions.has(session.sessionId)) continue;
 
-    const { status, mtime } = getSessionStatus(session.jsonlPath);
+    const { status, mtime } = getSessionStatus(session.jsonlPath, session.projectPath);
     if (mtime === 0) continue;
 
     results.push({
