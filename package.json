@@ -5,12 +5,10 @@
   "description": "Floating monitor for Claude Code sessions",
   "license": "MIT",
   "main": "main.js",
-  "bin": {
-    "claudeboard": "./cli.js"
-  },
   "scripts": {
     "start": "electron .",
-    "package": "electron-builder --mac --config"
+    "package": "electron-builder --mac --config",
+    "test": "node test/scanner.test.js && node test/notify.test.js && node test/focus.test.js"
   },
   "build": {
     "appId": "com.claus.claudeboard",
@@ -22,14 +20,17 @@
       "category": "public.app-category.developer-tools"
     },
     "files": [
-      "cli.js",
       "main.js",
+      "scanner.js",
+      "notify.js",
+      "focus.js",
       "preload.js",
       "renderer.js",
       "index.html",
       "styles.css",
       "help.html",
-      "build/icon.png"
+      "build/icon.png",
+      "!test/**"
     ]
   },
   "devDependencies": {

@@ -1,7 +1,9 @@
-const { app, BrowserWindow, ipcMain, dialog } = require("electron");
+const { app, BrowserWindow, ipcMain, Notification } = require("electron");
 const path = require("path");
 const fs = require("fs");
-const { execSync } = require("child_process");
+const scanner = require("./scanner");
+const { diffStatuses } = require("./notify");
+const { focusSession } = require("./focus");
 
 const WIDTH = 440;
 const BASE_HEIGHT = 52; // drag region + footer
@@ -15,20 +17,38 @@ const DATA_FILE = path.join(
 );
 
 function loadData() {
+  let data;
   try {
-    const data = JSON.parse(fs.readFileSync(DATA_FILE, "utf-8"));
-    if (!data.projects) data.projects = [];
-    if (!data.archivedProjects) data.archivedProjects = [];
-    if (!data.archivedSessions) data.archivedSessions = [];
-    if (!data.sessionNames) data.sessionNames = {};
-    return data;
+    data = JSON.parse(fs.readFileSync(DATA_FILE, "utf-8"));
   } catch {
-    return { projects: [], archivedProjects: [], archivedSessions: [], sessionNames: {} };
+    data = {};
   }
+  // Migrate legacy fields: archivedProjects -> archivedRepos.
+  if (data.archivedProjects && !data.archivedRepos) {
+    data.archivedRepos = data.archivedProjects;
+  }
+  delete data.archivedProjects;
+  delete data.projects;
+  if (!data.archivedRepos) data.archivedRepos = [];
+  if (!data.archivedSessions) data.archivedSessions = [];
+  if (!data.sessionNames) data.sessionNames = {};
+  return data;
 }
 
 function saveData(data) {
-  fs.writeFileSync(DATA_FILE, JSON.stringify(data, null, 2), "utf-8");
+  const tmpFile = path.join(
+    path.dirname(DATA_FILE),
+    `.claudeboard.json.tmp.${process.pid}`,
+  );
+  try {
+    fs.writeFileSync(tmpFile, JSON.stringify(data, null, 2), "utf-8");
+    fs.renameSync(tmpFile, DATA_FILE);
+  } catch (err) {
+    try {
+      fs.unlinkSync(tmpFile);
+    } catch {}
+    throw err;
+  }
 }
 
 let mainWindow;
@@ -53,245 +73,91 @@ function createWindow() {
   mainWindow.loadFile("index.html");
 }
 
-// --- JSONL session scanning ---
+// --- Session scanning ---
 
-const PROJECTS_DIR = path.join(
-  process.env.HOME || process.env.USERPROFILE,
-  ".claude",
-  "projects",
-);
+/** @type {Map<string, {mtime: number, aiTitle: string|null, lastPrompt: string|null}>} */
+const titleCache = new Map();
 
-const WORKING_THRESHOLD_MS = 30 * 1000;
-const IDLE_THRESHOLD_MS = 5 * 60 * 1000;
+/** @type {Map<string, string>} sessionId -> last-seen status */
+const statusMap = new Map();
+let seededStatus = false;
+
+function sessionDisplayName(s) {
+  return s.sessionName || s.aiTitle || s.sessionId.slice(0, 8);
+}
+
+function fireNotification(s) {
+  if (!Notification.isSupported()) return;
+  const title = s.repoName
+    ? `${sessionDisplayName(s)} · ${s.repoName}`
+    : sessionDisplayName(s);
+  const body = s.message || "Needs your input";
+  const notification = new Notification({ title, body });
+  notification.on("click", () => {
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.show();
+      mainWindow.focus();
+    }
+  });
+  notification.show();
+}
 
 /**
- * Returns a Set of project paths that have a running `claude` process.
- * Cached for 5 seconds to avoid shelling out on every session check.
+ * Diff the current results against the last-seen status map, firing
+ * notifications on transitions into needs_input and updating the dock badge.
+ * @param {Object[]} results filtered, decorated sessions
  */
-let _activeCwdsCache = { ts: 0, cwds: new Set() };
-const ACTIVE_CWDS_TTL_MS = 5_000;
+function processNotifications(results) {
+  const { toNotify, badgeCount, nextMap } = diffStatuses(
+    statusMap,
+    results,
+    !seededStatus,
+  );
 
-function getActiveProjectPaths() {
-  const now = Date.now();
-  if (now - _activeCwdsCache.ts < ACTIVE_CWDS_TTL_MS) {
-    return _activeCwdsCache.cwds;
+  if (seededStatus) {
+    for (const s of toNotify) fireNotification(s);
   }
+  seededStatus = true;
 
-  const cwds = new Set();
-  try {
-    // Get PIDs of processes named 'claude'
-    const pids = execSync("pgrep -x claude", { encoding: "utf-8", timeout: 3000 })
-      .trim()
-      .split("\n")
-      .filter(Boolean);
+  statusMap.clear();
+  for (const [id, status] of nextMap) statusMap.set(id, status);
 
-    for (const pid of pids) {
-      try {
-        const lsofOut = execSync(`lsof -p ${pid} -Fn 2>/dev/null | grep -A1 '^fcwd$' | grep '^n'`, {
-          encoding: "utf-8",
-          timeout: 3000,
-        }).trim();
-        if (lsofOut.startsWith("n")) {
-          cwds.add(lsofOut.slice(1));
-        }
-      } catch {
-        // Process may have exited
-      }
-    }
-  } catch {
-    // No claude processes running
+  if (process.platform === "darwin" && app.dock) {
+    app.dock.setBadge(badgeCount > 0 ? String(badgeCount) : "");
   }
-
-  _activeCwdsCache = { ts: now, cwds };
-  return cwds;
-}
-
-function encodePath(projectPath) {
-  return projectPath.replace(/\//g, "-");
-}
-
-function discoverSessions() {
-  const data = loadData();
-  const results = [];
-
-  for (const projectPath of data.projects || []) {
-    const dirName = encodePath(projectPath);
-    const projDir = path.join(PROJECTS_DIR, dirName);
-
-    let files;
-    try {
-      files = fs.readdirSync(projDir);
-    } catch {
-      continue;
-    }
-
-    for (const file of files) {
-      if (!file.endsWith(".jsonl")) continue;
-      const sessionId = file.replace(".jsonl", "");
-      results.push({
-        projectPath,
-        projectName: path.basename(projectPath),
-        sessionId,
-        jsonlPath: path.join(projDir, file),
-      });
-    }
-  }
-  return results;
-}
-
-function getSessionStatus(jsonlPath, projectPath) {
-  let mtime;
-  try {
-    mtime = fs.statSync(jsonlPath).mtimeMs;
-  } catch {
-    return { status: "stopped", mtime: 0 };
-  }
-
-  const age = Date.now() - mtime;
-
-  if (age >= IDLE_THRESHOLD_MS) {
-    return { status: "stopped", mtime };
-  }
-
-  // File was recently modified — verify a claude process is actually running
-  // in this project directory. If not, the session was likely cleared/ended.
-  const activePaths = getActiveProjectPaths();
-  if (!activePaths.has(projectPath)) {
-    return { status: "stopped", mtime };
-  }
-
-  if (age < WORKING_THRESHOLD_MS) {
-    return { status: "working", mtime };
-  }
-  return { status: "idle", mtime };
 }
 
 function scanAll() {
   const data = loadData();
-  const sessions = discoverSessions();
   const archivedSessions = new Set(data.archivedSessions);
+  const archivedRepos = new Set(data.archivedRepos);
+
+  const sessions = scanner.scanSessions({ titleCache });
 
   const results = [];
-  for (const session of sessions) {
-    if (archivedSessions.has(session.sessionId)) continue;
-
-    const { status, mtime } = getSessionStatus(session.jsonlPath, session.projectPath);
-    if (mtime === 0) continue;
+  for (const s of sessions) {
+    if (archivedSessions.has(s.sessionId)) continue;
+    if (archivedRepos.has(s.repoRoot)) continue;
 
     results.push({
-      key: `${session.projectName}:${session.sessionId}`,
-      project: session.projectName,
-      projectPath: session.projectPath,
-      sessionId: session.sessionId,
-      sessionName: data.sessionNames[session.sessionId] || null,
-      status,
-      mtime,
+      ...s,
+      repoName: path.basename(s.repoRoot || s.cwd || s.sessionId),
+      worktreeName:
+        s.cwd && s.repoRoot && s.cwd !== s.repoRoot ? path.basename(s.cwd) : null,
+      sessionName: data.sessionNames[s.sessionId] || null,
     });
   }
 
-  results.sort((a, b) => {
-    const cmp = a.project.localeCompare(b.project);
-    if (cmp !== 0) return cmp;
-    return b.mtime - a.mtime;
-  });
+  processNotifications(results);
 
   return results;
-}
-
-/**
- * Extract the project path (cwd) from a .jsonl session file.
- * Reads lines until it finds one with a "cwd" field.
- */
-function extractCwdFromJsonl(jsonlPath) {
-  let fd;
-  try {
-    fd = fs.openSync(jsonlPath, "r");
-    const buf = Buffer.alloc(4096);
-    const bytesRead = fs.readSync(fd, buf, 0, 4096, 0);
-    fs.closeSync(fd);
-
-    const chunk = buf.toString("utf-8", 0, bytesRead);
-    const lines = chunk.split("\n");
-    for (const line of lines) {
-      if (!line.trim()) continue;
-      try {
-        const entry = JSON.parse(line);
-        if (entry.cwd) return entry.cwd;
-      } catch {
-        continue;
-      }
-    }
-  } catch {
-    if (fd !== undefined) try { fs.closeSync(fd); } catch {}
-  }
-  return null;
-}
-
-function discoverUntracked() {
-  const data = loadData();
-  const tracked = new Set(data.projects);
-  const archived = new Set(data.archivedProjects);
-  const seen = new Set();
-  const suggestions = [];
-
-  let dirs;
-  try {
-    dirs = fs.readdirSync(PROJECTS_DIR);
-  } catch {
-    return [];
-  }
-
-  for (const dirName of dirs) {
-    const projDir = path.join(PROJECTS_DIR, dirName);
-
-    let stat;
-    try {
-      stat = fs.statSync(projDir);
-    } catch {
-      continue;
-    }
-    if (!stat.isDirectory()) continue;
-
-    // Find a .jsonl file to extract the real cwd
-    let files;
-    try {
-      files = fs.readdirSync(projDir);
-    } catch {
-      continue;
-    }
-
-    const jsonlFile = files.find((f) => f.endsWith(".jsonl"));
-    if (!jsonlFile) continue;
-
-    const projectPath = extractCwdFromJsonl(path.join(projDir, jsonlFile));
-    if (!projectPath) continue;
-
-    // Skip duplicates, already tracked, or archived
-    if (seen.has(projectPath)) continue;
-    if (tracked.has(projectPath)) continue;
-    if (archived.has(projectPath)) continue;
-    seen.add(projectPath);
-
-    // Verify path exists on disk
-    try {
-      fs.accessSync(projectPath);
-    } catch {
-      continue;
-    }
-
-    suggestions.push({
-      projectPath,
-      projectName: path.basename(projectPath),
-    });
-  }
-
-  return suggestions;
 }
 
 // --- File watcher with debounce ---
 
 let debounceTimer = null;
-let watchers = [];
+let stateWatcher = null;
+let dataWatcher = null;
 
 function notifyRenderer() {
   if (mainWindow && !mainWindow.isDestroyed()) {
@@ -303,42 +169,42 @@ function scheduleScan() {
   if (debounceTimer) clearTimeout(debounceTimer);
   debounceTimer = setTimeout(() => {
     notifyRenderer();
-  }, 2000);
+  }, 500);
 }
 
 function startWatchers() {
-  // Close existing watchers
-  for (const w of watchers) {
-    try { w.close(); } catch {}
-  }
-  watchers = [];
-
-  const data = loadData();
-  for (const projectPath of data.projects || []) {
-    const dirName = encodePath(projectPath);
-    const projDir = path.join(PROJECTS_DIR, dirName);
+  if (stateWatcher) {
     try {
-      const watcher = fs.watch(projDir, { recursive: false }, (_eventType, filename) => {
-        if (filename && filename.endsWith(".jsonl")) {
-          scheduleScan();
-        }
-      });
-      watcher.on("error", () => {});
-      watchers.push(watcher);
-    } catch {
-      // Directory may not exist yet
-    }
+      stateWatcher.close();
+    } catch {}
+    stateWatcher = null;
   }
 
-  // Also watch the data file for project list changes
+  if (dataWatcher) {
+    try {
+      dataWatcher.close();
+    } catch {}
+    dataWatcher = null;
+  }
+
+  const stateDir = scanner.getStateDir();
   try {
-    const dataWatcher = fs.watch(DATA_FILE, () => {
+    fs.mkdirSync(stateDir, { recursive: true });
+  } catch {}
+
+  try {
+    stateWatcher = fs.watch(stateDir, { recursive: false }, () => {
       scheduleScan();
-      // Restart watchers since project list may have changed
-      setTimeout(() => startWatchers(), 500);
     });
+    stateWatcher.on("error", () => {});
+  } catch {
+    // Directory may not exist yet; fallback poll will cover it.
+  }
+
+  // Also watch the data file for archive/rename changes.
+  try {
+    dataWatcher = fs.watch(DATA_FILE, () => scheduleScan());
     dataWatcher.on("error", () => {});
-    watchers.push(dataWatcher);
   } catch {}
 }
 
@@ -357,67 +223,29 @@ ipcMain.handle("open-help", () => {
   }
   helpWindow = new BrowserWindow({
     width: 300,
-    height: 340,
+    height: 360,
     resizable: false,
     alwaysOnTop: true,
     titleBarStyle: "hiddenInset",
     backgroundColor: "#111111",
   });
   helpWindow.loadFile("help.html");
-  helpWindow.on("closed", () => { helpWindow = null; });
-});
-
-ipcMain.handle("add-project", async () => {
-  const result = await dialog.showOpenDialog(mainWindow, {
-    properties: ["openDirectory"],
-    message: "Choose a project directory to track",
+  helpWindow.on("closed", () => {
+    helpWindow = null;
   });
-  if (result.canceled || result.filePaths.length === 0) return null;
-
-  const dir = result.filePaths[0];
-  const data = loadData();
-  if (!data.projects) data.projects = [];
-  if (!data.projects.includes(dir)) {
-    data.projects.push(dir);
-    saveData(data);
-  }
-  return dir;
 });
 
-ipcMain.handle("remove-project", (_event, projectPath) => {
+ipcMain.handle("archive-repo", (_event, repoRoot) => {
   const data = loadData();
-  data.projects = data.projects.filter((p) => p !== projectPath);
-  saveData(data);
-});
-
-ipcMain.handle("get-suggestions", () => {
-  return discoverUntracked();
-});
-
-ipcMain.handle("add-project-path", (_event, projectPath) => {
-  const data = loadData();
-  if (!data.projects.includes(projectPath)) {
-    data.projects.push(projectPath);
-    saveData(data);
-  }
-  return projectPath;
-});
-
-ipcMain.handle("archive-project", (_event, projectPath) => {
-  const data = loadData();
-  data.projects = data.projects.filter((p) => p !== projectPath);
-  if (!data.archivedProjects.includes(projectPath)) {
-    data.archivedProjects.push(projectPath);
+  if (!data.archivedRepos.includes(repoRoot)) {
+    data.archivedRepos.push(repoRoot);
   }
   saveData(data);
 });
 
-ipcMain.handle("unarchive-project", (_event, projectPath) => {
+ipcMain.handle("unarchive-repo", (_event, repoRoot) => {
   const data = loadData();
-  data.archivedProjects = data.archivedProjects.filter((p) => p !== projectPath);
-  if (!data.projects.includes(projectPath)) {
-    data.projects.push(projectPath);
-  }
+  data.archivedRepos = data.archivedRepos.filter((p) => p !== repoRoot);
   saveData(data);
 });
 
@@ -437,49 +265,34 @@ ipcMain.handle("unarchive-session", (_event, sessionId) => {
 
 ipcMain.handle("get-archived", () => {
   const data = loadData();
+  const archivedRepoSet = new Set(data.archivedRepos);
+  const archivedSessionIds = new Set(data.archivedSessions);
 
-  const archivedProjects = data.archivedProjects.map((projectPath) => ({
-    projectPath,
-    projectName: path.basename(projectPath),
+  // Scan raw sessions (ignoring archive filters) to source metadata.
+  const allSessions = scanner.scanSessions({ titleCache });
+
+  const archivedRepos = data.archivedRepos.map((repoRoot) => ({
+    repoRoot,
+    repoName: path.basename(repoRoot),
   }));
 
   const archivedSessions = [];
-  const archivedSessionIds = new Set(data.archivedSessions);
-
-  // Scan all project dirs to find metadata for archived sessions
-  for (const projectPath of [...data.projects, ...data.archivedProjects]) {
-    const dirName = encodePath(projectPath);
-    const projDir = path.join(PROJECTS_DIR, dirName);
-
-    let files;
-    try {
-      files = fs.readdirSync(projDir);
-    } catch {
-      continue;
-    }
-
-    for (const file of files) {
-      if (!file.endsWith(".jsonl")) continue;
-      const sessionId = file.replace(".jsonl", "");
-      if (!archivedSessionIds.has(sessionId)) continue;
-
-      const jsonlPath = path.join(projDir, file);
-      let mtime = 0;
-      try {
-        mtime = fs.statSync(jsonlPath).mtimeMs;
-      } catch {}
-
-      archivedSessions.push({
-        projectPath,
-        projectName: path.basename(projectPath),
-        sessionId,
-        sessionName: data.sessionNames[sessionId] || null,
-        mtime,
-      });
-    }
+  const seen = new Set();
+  for (const s of allSessions) {
+    if (!archivedSessionIds.has(s.sessionId)) continue;
+    if (seen.has(s.sessionId)) continue;
+    seen.add(s.sessionId);
+    archivedSessions.push({
+      sessionId: s.sessionId,
+      repoRoot: s.repoRoot,
+      repoName: path.basename(s.repoRoot || s.cwd || s.sessionId),
+      sessionName: data.sessionNames[s.sessionId] || null,
+      aiTitle: s.aiTitle || null,
+      ts: s.ts,
+    });
   }
 
-  return { archivedProjects, archivedSessions };
+  return { archivedRepos, archivedSessions, archivedRepoSet: [...archivedRepoSet] };
 });
 
 ipcMain.handle("rename-session", (_event, sessionId, name) => {
@@ -493,9 +306,18 @@ ipcMain.handle("rename-session", (_event, sessionId, name) => {
   saveData(data);
 });
 
+ipcMain.handle("focus-session", (_event, pid) => {
+  if (!Number.isInteger(pid) || pid <= 0) return;
+  // Fire-and-forget; never block the main process or surface errors.
+  focusSession(pid).catch(() => {});
+});
+
 ipcMain.handle("resize-window", (_event, rowCount) => {
   if (!mainWindow || mainWindow.isDestroyed()) return;
-  const h = Math.min(Math.max(BASE_HEIGHT + rowCount * ROW_HEIGHT, MIN_HEIGHT), MAX_HEIGHT);
+  const h = Math.min(
+    Math.max(BASE_HEIGHT + rowCount * ROW_HEIGHT, MIN_HEIGHT),
+    MAX_HEIGHT,
+  );
   const bounds = mainWindow.getBounds();
   mainWindow.setBounds({ x: bounds.x, y: bounds.y, width: WIDTH, height: h });
 });
@@ -514,7 +336,7 @@ app.whenReady().then(() => {
   createWindow();
   startWatchers();
 
-  // Fallback poll every 30s
+  // Fallback poll every 30s.
   setInterval(() => {
     notifyRenderer();
   }, 30000);

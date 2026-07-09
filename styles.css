@@ -11,8 +11,10 @@
   --card: #1a1a1a;
   --text: #f0f0f0;
   --text-dim: #666666;
-  --green: #4ade80;
   --red: #ef4444;
+  --amber: #f59e0b;
+  --green: #4ade80;
+  --grey: #444444;
   --radius: 8px;
 }
 
@@ -97,8 +99,6 @@ body {
   background: transparent;
 }
 
-.project-group { }
-
 .group-header {
   display: flex;
   align-items: center;
@@ -110,8 +110,6 @@ body {
   font-weight: 600;
 }
 
-.group-header:hover { color: var(--text); }
-
 .group-arrow {
   font-size: 10px;
   width: 12px;
@@ -120,11 +118,14 @@ body {
 
 .group-name {
   flex: 1;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
-.group-sessions { }
-
-.group-sessions.collapsed { display: none; }
+.group-sessions.collapsed {
+  display: none;
+}
 
 .session {
   display: flex;
@@ -139,6 +140,10 @@ body {
 
 .session:hover {
   background: #222222;
+}
+
+.session.clickable {
+  cursor: pointer;
 }
 
 .archive-btn {
@@ -171,18 +176,27 @@ body {
   flex-shrink: 0;
 }
 
-.idle .dot {
+/* --- Status colors --- */
+
+.needs_input .dot {
+  background: var(--red);
+  box-shadow: 0 0 8px var(--red);
+  animation: pulse-strong 1s ease-in-out infinite;
+}
+
+.working .dot {
+  background: var(--amber);
+  box-shadow: 0 0 6px var(--amber);
+  animation: pulse 2s ease-in-out infinite;
+}
+
+.waiting .dot {
   background: var(--green);
   box-shadow: 0 0 6px var(--green);
 }
 
-.working .dot {
-  background: var(--red);
-  box-shadow: 0 0 6px var(--red);
-}
-
-.stopped .dot {
-  background: #444;
+.ended .dot {
+  background: var(--grey);
 }
 
 .label {
@@ -192,16 +206,35 @@ body {
   text-overflow: ellipsis;
 }
 
-.idle .label {
+.label .worktree {
+  color: var(--text-dim);
+  font-size: 11px;
+}
+
+.label .status-text {
+  color: var(--text-dim);
+  font-size: 11px;
+}
+
+.needs_input .label .name {
+  color: var(--red);
+  font-weight: 600;
+}
+
+.working .label .name {
+  color: var(--amber);
+}
+
+.waiting .label .name {
   color: var(--green);
 }
 
-.working .label {
-  color: var(--red);
+.ended .label .name {
+  color: var(--text-dim);
 }
 
-.stopped .label {
-  color: var(--text-dim);
+.ended {
+  opacity: 0.6;
 }
 
 .rename-input {
@@ -223,13 +256,6 @@ body {
   line-height: 1.8;
 }
 
-.empty code {
-  background: #222;
-  padding: 2px 6px;
-  border-radius: 3px;
-  font-size: 11px;
-}
-
 #footer {
   padding: 8px 16px 10px;
   color: var(--text-dim);
@@ -247,8 +273,16 @@ body {
   }
 }
 
-.working .dot {
-  animation: pulse 2s ease-in-out infinite;
+@keyframes pulse-strong {
+  0%,
+  100% {
+    opacity: 1;
+    transform: scale(1);
+  }
+  50% {
+    opacity: 0.35;
+    transform: scale(0.8);
+  }
 }
 
 /* Session archive button */
@@ -277,13 +311,7 @@ body {
   color: var(--text);
 }
 
-/* Suggestions toggle active state */
-.header-btn.active {
-  color: var(--text);
-  border-color: var(--text);
-}
-
-/* Section headers (suggestions, archived) */
+/* Section headers (archived) */
 .section-header {
   font-size: 10px;
   font-weight: 600;
@@ -293,50 +321,6 @@ body {
   padding: 10px 10px 4px;
   border-top: 1px solid #222;
   margin-top: 4px;
-}
-
-/* Suggestions */
-.suggestion-row {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  padding: 6px 10px;
-  margin-left: 20px;
-  border-radius: var(--radius);
-  color: var(--text-dim);
-}
-
-.suggestion-row:hover {
-  background: #1a1a1a;
-}
-
-.suggestion-name {
-  flex: 1;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  font-size: 12px;
-}
-
-.suggestion-add-btn {
-  background: none;
-  border: 1px solid #333;
-  border-radius: 50%;
-  color: var(--text-dim);
-  cursor: pointer;
-  font-size: 11px;
-  width: 20px;
-  height: 20px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  flex-shrink: 0;
-  transition: color 0.15s, border-color 0.15s;
-}
-
-.suggestion-add-btn:hover {
-  color: var(--green);
-  border-color: var(--green);
 }
 
 /* Archived section */
@@ -404,4 +388,3 @@ body {
 .footer-archived.active {
   color: var(--text);
 }
-
